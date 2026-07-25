@@ -1,6 +1,8 @@
 import os
+import shlex
+import subprocess
 import yaml
-from pathlib import Path
+from pathlib import PurePosixPath
 from fastmcp import FastMCP
 from dotenv import load_dotenv
 
@@ -46,32 +48,50 @@ for _tag in (
 def _ha_yaml_load(content: str):
     return yaml.load(content, Loader=_HALoader)
 
-_CONFIG_PATH = Path(os.getenv("HA_CONFIG_PATH", "/config"))
+# HA's config directory lives on the remote HA host, not on this machine — there is
+# no local /config to read/write. All file access goes over SSH to the host below
+# (see ~/.ssh/config), which must have a passwordless key configured.
+_CONFIG_PATH = "/config"
+_SSH_HOST = os.getenv("HA_SSH_HOST", "ha-green")
+_SSH_TIMEOUT = 15
 
 _ALLOWED_EXTENSIONS = {".yaml", ".yml", ".json", ".txt"}
 _BLOCKED_PATHS = {"secrets.yaml", ".storage"}
 
 
-def _safe_path(relative_path: str) -> Path:
-    """Resolve path safely within HA config directory."""
-    path = (_CONFIG_PATH / relative_path).resolve()
-    if not str(path).startswith(str(_CONFIG_PATH.resolve())):
-        raise PermissionError(f"Path outside config directory: {path}")
-    if path.suffix not in _ALLOWED_EXTENSIONS:
-        raise PermissionError(f"File extension not allowed: {path.suffix}")
-    for blocked in _BLOCKED_PATHS:
-        if blocked in path.parts:
-            raise PermissionError(f"Access to '{blocked}' is blocked")
-    return path
+def _ssh(remote_cmd: str, input_data: str | None = None) -> subprocess.CompletedProcess:
+    """Run a command on the HA host over SSH."""
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={_SSH_TIMEOUT}", _SSH_HOST, remote_cmd],
+        input=input_data,
+        capture_output=True,
+        text=True,
+        timeout=_SSH_TIMEOUT + 10,
+    )
+
+
+def _safe_remote_path(relative_path: str) -> str:
+    """Validate relative_path and return the absolute remote path."""
+    rel = PurePosixPath(relative_path)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise PermissionError(f"Path outside config directory: {relative_path}")
+    if rel.suffix not in _ALLOWED_EXTENSIONS:
+        raise PermissionError(f"File extension not allowed: {rel.suffix}")
+    if any(blocked in rel.parts for blocked in _BLOCKED_PATHS):
+        raise PermissionError(f"Access to blocked path segment in: {relative_path}")
+    return f"{_CONFIG_PATH}/{rel}"
 
 
 @mcp.tool()
 def read_config_file(relative_path: str) -> str:
     """Read a config file relative to HA config dir. E.g. 'automations.yaml' or 'packages/lights.yaml'."""
-    path = _safe_path(relative_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    return path.read_text(encoding="utf-8")
+    remote_path = _safe_remote_path(relative_path)
+    result = _ssh(f"cat {shlex.quote(remote_path)}")
+    if result.returncode != 0:
+        if "No such file" in result.stderr:
+            raise FileNotFoundError(f"File not found: {remote_path}")
+        raise RuntimeError(f"SSH read failed ({_SSH_HOST}): {result.stderr.strip()}")
+    return result.stdout
 
 
 @mcp.tool()
@@ -79,32 +99,46 @@ def write_config_file(relative_path: str, content: str, validate_yaml: bool = Tr
     """Write content to a config file. Validates YAML syntax before saving (set validate_yaml=False to skip).
     Creates parent directories as needed.
     """
-    path = _safe_path(relative_path)
+    remote_path = _safe_remote_path(relative_path)
+    suffix = PurePosixPath(remote_path).suffix
 
-    if validate_yaml and path.suffix in {".yaml", ".yml"}:
+    if validate_yaml and suffix in {".yaml", ".yml"}:
         try:
             _ha_yaml_load(content)
         except yaml.YAMLError as e:
             return {"success": False, "error": f"YAML validation failed: {e}"}
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return {"success": True, "path": str(path)}
+    remote_dir = str(PurePosixPath(remote_path).parent)
+    cmd = f"mkdir -p {shlex.quote(remote_dir)} && cat > {shlex.quote(remote_path)}"
+    result = _ssh(cmd, input_data=content)
+    if result.returncode != 0:
+        return {"success": False, "error": f"SSH write failed ({_SSH_HOST}): {result.stderr.strip()}"}
+    return {"success": True, "path": remote_path}
 
 
 @mcp.tool()
 def list_config_files(subdirectory: str = "") -> list[str]:
     """List files in the HA config directory (or a subdirectory)."""
-    base = _CONFIG_PATH / subdirectory if subdirectory else _CONFIG_PATH
-    base = base.resolve()
-    if not base.exists():
+    rel = PurePosixPath(subdirectory) if subdirectory else PurePosixPath(".")
+    if rel.is_absolute() or ".." in rel.parts:
+        raise PermissionError(f"Path outside config directory: {subdirectory}")
+    remote_dir = f"{_CONFIG_PATH}/{rel}" if subdirectory else _CONFIG_PATH
+    result = _ssh(f"find {shlex.quote(remote_dir)} -type f 2>/dev/null")
+    if result.returncode != 0:
         return []
-    return [
-        str(f.relative_to(_CONFIG_PATH))
-        for f in base.rglob("*")
-        if f.is_file() and f.suffix in _ALLOWED_EXTENSIONS
-        and not any(b in f.parts for b in _BLOCKED_PATHS)
-    ]
+    files = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        p = PurePosixPath(line)
+        if p.suffix not in _ALLOWED_EXTENSIONS or any(b in p.parts for b in _BLOCKED_PATHS):
+            continue
+        try:
+            files.append(str(p.relative_to(_CONFIG_PATH)))
+        except ValueError:
+            continue
+    return files
 
 
 @mcp.tool()
@@ -124,28 +158,37 @@ def validate_yaml_content(content: str) -> dict:
 @mcp.tool()
 def delete_config_file(relative_path: str) -> dict:
     """Delete a config file. Will NOT delete if it has no known safe extension."""
-    path = _safe_path(relative_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    path.unlink()
-    return {"success": True, "deleted": str(path)}
+    remote_path = _safe_remote_path(relative_path)
+    check = _ssh(f"test -f {shlex.quote(remote_path)}")
+    if check.returncode != 0:
+        raise FileNotFoundError(f"File not found: {remote_path}")
+    result = _ssh(f"rm {shlex.quote(remote_path)}")
+    if result.returncode != 0:
+        raise RuntimeError(f"SSH delete failed ({_SSH_HOST}): {result.stderr.strip()}")
+    return {"success": True, "deleted": remote_path}
 
 
 @mcp.tool()
 def append_to_config_file(relative_path: str, content: str, validate_yaml: bool = False) -> dict:
     """Append content to an existing config file (e.g. adding an automation entry to automations.yaml)."""
-    path = _safe_path(relative_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
+    remote_path = _safe_remote_path(relative_path)
+    check = _ssh(f"test -f {shlex.quote(remote_path)}")
+    if check.returncode != 0:
+        raise FileNotFoundError(f"File not found: {remote_path}")
 
-    existing = path.read_text(encoding="utf-8")
-    combined = existing + "\n" + content
+    read_result = _ssh(f"cat {shlex.quote(remote_path)}")
+    if read_result.returncode != 0:
+        raise RuntimeError(f"SSH read failed ({_SSH_HOST}): {read_result.stderr.strip()}")
+    combined = read_result.stdout + "\n" + content
 
-    if validate_yaml and path.suffix in {".yaml", ".yml"}:
+    suffix = PurePosixPath(remote_path).suffix
+    if validate_yaml and suffix in {".yaml", ".yml"}:
         try:
             _ha_yaml_load(combined)
         except yaml.YAMLError as e:
             return {"success": False, "error": f"YAML validation failed after append: {e}"}
 
-    path.write_text(combined, encoding="utf-8")
-    return {"success": True, "path": str(path)}
+    write_result = _ssh(f"cat > {shlex.quote(remote_path)}", input_data=combined)
+    if write_result.returncode != 0:
+        return {"success": False, "error": f"SSH write failed ({_SSH_HOST}): {write_result.stderr.strip()}"}
+    return {"success": True, "path": remote_path}

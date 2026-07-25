@@ -69,16 +69,13 @@ def create_event(
 
 @mcp.tool()
 def delete_event(entity_id: str, uid: str) -> dict:
-    """Delete a calendar event by its `uid`.
+    """Delete a calendar event by its `uid`, via WS `calendar/event/delete`.
 
-    HA does not expose a stable `calendar.delete_event` service in core; this
-    attempts the call and otherwise reports `not_implemented`.
+    Requires the calendar integration to support event deletion
+    (`CalendarEntityFeature.DELETE_EVENT`); not every calendar platform does.
     """
     try:
-        result = ha.call_service(
-            "calendar", "delete_event",
-            {"entity_id": entity_id, "uid": uid},
-        )
+        result = ha._ws_call("calendar/event/delete", entity_id=entity_id, uid=uid)
         return {"entity_id": entity_id, "uid": uid, "result": result, "ok": True}
     except Exception as e:
         return {
@@ -86,5 +83,4 @@ def delete_event(entity_id: str, uid: str) -> dict:
             "uid": uid,
             "ok": False,
             "error": str(e),
-            "note": "calendar.delete_event is not a core HA service; not implemented for this calendar.",
         }

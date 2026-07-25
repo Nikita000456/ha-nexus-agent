@@ -46,7 +46,7 @@ def create_zone(
     icon: str | None = None,
     passive: bool = False,
 ) -> dict:
-    """Create a zone via WS `config/zone/create` (zone helper integration)."""
+    """Create a zone via WS `zone/create` (zone helper integration)."""
     payload: dict = {
         "name": name,
         "latitude": latitude,
@@ -57,7 +57,7 @@ def create_zone(
     if icon:
         payload["icon"] = icon
     try:
-        result = ha._ws_call("config/zone/create", **payload)
+        result = ha._ws_call("zone/create", **payload)
         return {"status": "created", "name": name, "result": result}
     except Exception as e:
         return {
@@ -77,7 +77,7 @@ def update_zone(
     icon: str | None = None,
     passive: bool | None = None,
 ) -> dict:
-    """Update a zone via WS `config/zone/update`; only the fields you pass are sent."""
+    """Update a zone via WS `zone/update`; only the fields you pass are sent."""
     zone_id = entity_id.split(".", 1)[1] if entity_id.startswith("zone.") else entity_id
     payload: dict = {"zone_id": zone_id}
     if latitude is not None:
@@ -93,7 +93,7 @@ def update_zone(
     if passive is not None:
         payload["passive"] = passive
     try:
-        result = ha._ws_call("config/zone/update", **payload)
+        result = ha._ws_call("zone/update", **payload)
         return {"status": "updated", "zone_id": zone_id, "result": result}
     except Exception as e:
         return {
@@ -105,10 +105,10 @@ def update_zone(
 
 @mcp.tool()
 def delete_zone(zone_id: str) -> dict:
-    """Delete a zone via WS `config/zone/delete` (accepts zone helper id or `zone.<id>`)."""
+    """Delete a zone via WS `zone/delete` (accepts zone helper id or `zone.<id>`)."""
     zid = zone_id.split(".", 1)[1] if zone_id.startswith("zone.") else zone_id
     try:
-        result = ha._ws_call("config/zone/delete", zone_id=zid)
+        result = ha._ws_call("zone/delete", zone_id=zid)
         return {"status": "deleted", "zone_id": zid, "result": result}
     except Exception as e:
         return {

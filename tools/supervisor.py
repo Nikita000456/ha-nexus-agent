@@ -1,53 +1,92 @@
 """Home Assistant Supervisor API — add-on lifecycle, backups, host/core management.
 
-Requires SUPERVISOR_TOKEN env var (auto-set when running as HA add-on).
-config.yaml must have `hassio_api: true` and `hassio_role: manager`.
+The internal `supervisor` hostname and SUPERVISOR_TOKEN only exist inside HA's own
+add-on containers — this MCP server runs on a separate machine with no route to
+either. The HA host (SSH alias `ha-green`) IS on that internal network, and its
+SSH session already carries a scoped SUPERVISOR_TOKEN env var, so requests are
+made by running curl there instead of locally (same REST paths/payloads as
+before — only the transport changed).
 """
+import json as json_mod
 import os
-import httpx
+import shlex
+import subprocess
+
 from fastmcp import FastMCP
 
 mcp = FastMCP("supervisor")
 
-_BASE_URL = "http://supervisor"
+_SSH_HOST = os.getenv("HA_SSH_HOST", "ha-green")
+_SSH_TIMEOUT = 30
+_STATUS_MARKER = "___HTTP_STATUS___"
+
+
+def _ssh_run(remote_cmd: str, input_data: str | None = None) -> subprocess.CompletedProcess:
+    """Run a command on the HA host over SSH."""
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={_SSH_TIMEOUT}", _SSH_HOST, remote_cmd],
+        input=input_data,
+        capture_output=True,
+        text=True,
+        timeout=_SSH_TIMEOUT + 15,
+    )
 
 
 def _supervisor_request(method: str, path: str, json: dict | None = None) -> dict:
-    """Internal: call Supervisor REST API with bearer token from env."""
-    token = os.getenv("SUPERVISOR_TOKEN")
-    if not token:
-        return {"error": "SUPERVISOR_TOKEN not set — Nexus must run as HA add-on for Supervisor API"}
+    """Internal: call Supervisor REST API via curl on the HA host (over SSH)."""
+    parts = [
+        "curl", "-sS", "--max-time", "30",
+        "-X", shlex.quote(method.upper()),
+        "-H", '"Authorization: Bearer $SUPERVISOR_TOKEN"',
+        "-w", shlex.quote(f"\n{_STATUS_MARKER}%{{http_code}}"),
+    ]
+    input_data = None
+    if json is not None:
+        parts += ["-H", shlex.quote("Content-Type: application/json"), "--data-binary", "@-"]
+        input_data = json_mod.dumps(json)
+    parts += [shlex.quote(f"http://supervisor{path}")]
     try:
-        with httpx.Client(
-            base_url=_BASE_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        ) as c:
-            if method.upper() == "GET":
-                r = c.request(method, path)
-            else:
-                r = c.request(method, path, json=json or {})
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPStatusError as e:
-        return {"error": f"HTTP {e.response.status_code}", "detail": e.response.text}
-    except Exception as e:
-        return {"error": str(e)}
+        result = _ssh_run(" ".join(parts), input_data=input_data)
+    except subprocess.TimeoutExpired:
+        return {"error": f"SSH/curl timed out ({_SSH_HOST})"}
+    if result.returncode != 0:
+        return {"error": f"SSH/curl failed ({_SSH_HOST}): {result.stderr.strip()}"}
+    raw = result.stdout
+    if _STATUS_MARKER not in raw:
+        return {"error": "unexpected curl output", "raw": raw[:500]}
+    body_text, status_text = raw.rsplit(_STATUS_MARKER, 1)
+    try:
+        status_code = int(status_text.strip())
+    except ValueError:
+        status_code = 0
+    try:
+        data = json_mod.loads(body_text) if body_text.strip() else {}
+    except json_mod.JSONDecodeError:
+        return {"error": f"non-JSON response (HTTP {status_code})", "raw": body_text[:500]}
+    if status_code >= 400:
+        return {"error": f"HTTP {status_code}", "detail": data}
+    return data
 
 
 def _supervisor_get_text(path: str) -> str:
     """Internal: GET a text endpoint (e.g. logs) instead of JSON."""
-    token = os.getenv("SUPERVISOR_TOKEN")
-    if not token:
-        return ""
-    with httpx.Client(
-        base_url=_BASE_URL,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-    ) as c:
-        r = c.get(path)
-        r.raise_for_status()
-        return r.text
+    parts = [
+        "curl", "-sS", "--max-time", "30",
+        "-H", '"Authorization: Bearer $SUPERVISOR_TOKEN"',
+        "-w", shlex.quote(f"\n{_STATUS_MARKER}%{{http_code}}"),
+        shlex.quote(f"http://supervisor{path}"),
+    ]
+    result = _ssh_run(" ".join(parts))
+    if result.returncode != 0:
+        raise RuntimeError(f"SSH/curl failed ({_SSH_HOST}): {result.stderr.strip()}")
+    raw = result.stdout
+    if _STATUS_MARKER not in raw:
+        raise RuntimeError(f"unexpected curl output: {raw[:200]}")
+    body_text, status_text = raw.rsplit(_STATUS_MARKER, 1)
+    status_code = int(status_text.strip()) if status_text.strip().isdigit() else 0
+    if status_code >= 400:
+        raise RuntimeError(f"HTTP {status_code}: {body_text[:200]}")
+    return body_text
 
 
 # --- Add-on lifecycle ---
@@ -124,12 +163,10 @@ def get_addon_logs(slug: str, lines: int = 100) -> dict:
     """Get the last N log lines from an add-on (returns text wrapped in {logs: ...})."""
     try:
         text = _supervisor_get_text(f"/addons/{slug}/logs")
-    except httpx.HTTPStatusError as e:
-        return {"error": f"HTTP {e.response.status_code}", "detail": e.response.text}
     except Exception as e:
         return {"error": str(e)}
     if not text:
-        return {"error": "SUPERVISOR_TOKEN not set or empty response"}
+        return {"error": "empty response"}
     log_lines = text.splitlines()
     if lines > 0:
         log_lines = log_lines[-lines:]

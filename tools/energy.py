@@ -20,8 +20,6 @@ def get_energy_prefs() -> dict:
 def save_energy_prefs(
     energy_sources: list[dict] | None = None,
     device_consumption: list[dict] | None = None,
-    currency: str | None = None,
-    energy_per_unit: float | None = None,
 ) -> dict:
     """Save Energy Dashboard preferences (WS `energy/save_prefs`); only the fields you pass are sent."""
     payload: dict = {}
@@ -29,12 +27,8 @@ def save_energy_prefs(
         payload["energy_sources"] = energy_sources
     if device_consumption is not None:
         payload["device_consumption"] = device_consumption
-    if currency is not None:
-        payload["currency"] = currency
-    if energy_per_unit is not None:
-        payload["energy_per_unit"] = energy_per_unit
     if not payload:
-        return {"error": "no fields to save", "hint": "pass at least one of energy_sources, device_consumption, currency, energy_per_unit"}
+        return {"error": "no fields to save", "hint": "pass at least one of energy_sources, device_consumption"}
     try:
         result = ha._ws_call("energy/save_prefs", **payload)
         return {"status": "saved", "result": result, "fields": list(payload.keys())}

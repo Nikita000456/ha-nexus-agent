@@ -236,8 +236,9 @@ def set_entity_exposure(entity_id: str, assistant: str, should_expose: bool) -> 
 @mcp.tool()
 def get_entity_exposure(entity_id: str) -> dict:
     """Get exposure flags for an entity across all voice assistants."""
-    result = ha._ws_call("homeassistant/expose/get", entity_id=entity_id)
-    return {"entity_id": entity_id, "exposure": result}
+    result = ha._ws_call("homeassistant/expose_entity/list")
+    exposure = result.get("exposed_entities", {}).get(entity_id, {})
+    return {"entity_id": entity_id, "exposure": exposure}
 
 
 @mcp.tool()
@@ -248,8 +249,13 @@ def list_exposed_entities(assistant: str) -> dict:
     """
     if assistant not in _ASSISTANTS:
         raise ValueError(f"assistant must be one of {_ASSISTANTS}")
-    result = ha._ws_call("homeassistant/expose/list", assistant=assistant)
-    return {"assistant": assistant, "exposed": result}
+    result = ha._ws_call("homeassistant/expose_entity/list")
+    exposed = [
+        entity_id
+        for entity_id, assistants in result.get("exposed_entities", {}).items()
+        if assistants.get(assistant)
+    ]
+    return {"assistant": assistant, "exposed": exposed}
 
 
 @mcp.tool()

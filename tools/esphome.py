@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import os
 import httpx
-from pathlib import Path
 from fastmcp import FastMCP
 import ha_client as ha
+from tools.files import read_config_file, write_config_file, list_config_files
 
 mcp = FastMCP("esphome")
 
-_CONFIG_PATH = Path(os.getenv("HA_CONFIG_PATH", "/config"))
-_ESPHOME_DIR = _CONFIG_PATH / "esphome"
 _DASH_URL = os.getenv("ESPHOME_DASHBOARD_URL", "http://homeassistant.local:6052")
 _ESPHOME_SLUGS = ["a0d7b954_esphome", "esphome_esphome"]
 
@@ -73,12 +71,16 @@ def _dash(method: str, path: str, body: dict | None = None, timeout: int = 120) 
 
 
 def _yaml_names() -> list[str]:
-    if not _ESPHOME_DIR.exists():
-        return []
-    return sorted(
-        f.stem for f in _ESPHOME_DIR.glob("*.yaml")
-        if not f.name.startswith(".") and f.name != "secrets.yaml"
-    )
+    names = []
+    for rel in list_config_files("esphome"):
+        # top-level only, matching the old glob("*.yaml") (non-recursive) behavior
+        if rel.count("/") != 1:
+            continue
+        filename = rel.split("/", 1)[1]
+        if filename.startswith(".") or filename == "secrets.yaml" or not filename.endswith(".yaml"):
+            continue
+        names.append(filename[: -len(".yaml")])
+    return sorted(names)
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
@@ -155,17 +157,18 @@ def list_devices() -> dict:
 
 @mcp.tool()
 def get_config(name: str) -> dict:
-    """Read ESPHome device YAML config from /config/esphome/. Pass name with or without .yaml."""
+    """Read ESPHome device YAML config from `esphome/` on the HA host. Pass name with or without .yaml."""
     filename = name if name.endswith(".yaml") else f"{name}.yaml"
-    path = _ESPHOME_DIR / filename
-    if not path.exists():
-        return {"error": f"Not found: {filename}", "esphome_dir": str(_ESPHOME_DIR)}
-    return {"name": filename, "content": path.read_text(encoding="utf-8")}
+    try:
+        content = read_config_file(f"esphome/{filename}")
+    except FileNotFoundError:
+        return {"error": f"Not found: {filename}", "esphome_dir": "esphome/"}
+    return {"name": filename, "content": content}
 
 
 @mcp.tool()
 def write_config(name: str, content: str) -> dict:
-    """Write ESPHome device YAML config to /config/esphome/. Validates YAML syntax before saving.
+    """Write ESPHome device YAML config to `esphome/` on the HA host. Validates YAML syntax before saving.
 
     Supports HA custom tags (!secret, !include) — they pass through validation unchanged.
     Creates the file if it doesn't exist.
@@ -191,10 +194,11 @@ def write_config(name: str, content: str) -> dict:
         return {"success": False, "error": f"YAML validation failed: {e}"}
 
     filename = name if name.endswith(".yaml") else f"{name}.yaml"
-    path = _ESPHOME_DIR / filename
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return {"success": True, "name": filename, "path": str(path), "bytes": len(content.encode())}
+    # already validated above with the ESPHome-tag-aware loader; skip files.py's generic re-validation
+    write_result = write_config_file(f"esphome/{filename}", content, validate_yaml=False)
+    if not write_result.get("success"):
+        return {"success": False, "error": write_result.get("error")}
+    return {"success": True, "name": filename, "path": write_result["path"], "bytes": len(content.encode())}
 
 
 @mcp.tool()

@@ -111,7 +111,7 @@ def get_repairs() -> list[dict]:
     Returns current repair issues that require attention (deprecated config,
     broken integrations, required migrations, etc.).
     """
-    raw = ha._ws_call("repairs/list")
+    raw = ha._ws_call("repairs/list_issues")
     issues = raw if isinstance(raw, list) else raw.get("issues", [])
     return [
         {

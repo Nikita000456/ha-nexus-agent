@@ -30,7 +30,7 @@ def list_hacs_repositories(category: str | None = None) -> dict | list:
 @mcp.tool()
 def get_hacs_repository(repo_id: str) -> dict | list:
     """Get details about a single HACS repository by id."""
-    return _safe_ws("hacs/repository/info", repository=repo_id)
+    return _safe_ws("hacs/repository/info", repository_id=repo_id)
 
 
 @mcp.tool()
@@ -39,25 +39,25 @@ def install_hacs_repository(repo_id: str, version: str | None = None) -> dict | 
     kwargs: dict = {"repository": repo_id}
     if version:
         kwargs["version"] = version
-    return _safe_ws("hacs/repository/install", **kwargs)
+    return _safe_ws("hacs/repository/download", **kwargs)
 
 
 @mcp.tool()
 def uninstall_hacs_repository(repo_id: str) -> dict | list:
     """Uninstall a HACS repository by id."""
-    return _safe_ws("hacs/repository/uninstall", repository=repo_id)
+    return _safe_ws("hacs/repository/remove", repository=repo_id)
 
 
 @mcp.tool()
 def update_hacs_repository(repo_id: str) -> dict | list:
     """Update a HACS repository to its latest available version."""
-    return _safe_ws("hacs/repository/update", repository=repo_id)
+    return _safe_ws("hacs/repository/download", repository=repo_id)
 
 
 @mcp.tool()
 def add_custom_repository(url: str, category: str) -> dict | list:
     """Add a custom HACS repository by URL + category (integration, plugin, theme, template, appdaemon, python_script)."""
-    return _safe_ws("hacs/repository/add", repository=url, category=category)
+    return _safe_ws("hacs/repositories/add", repository=url, category=category)
 
 
 @mcp.tool()

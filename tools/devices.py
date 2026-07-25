@@ -63,11 +63,11 @@ def update_device(
 def remove_device(device_id: str, config_entry_id: str) -> dict:
     """Remove a device from a specific config entry.
 
-    Uses WS `config_entries/remove_device`. Both `device_id` and the owning
-    `config_entry_id` are required.
+    Uses WS `config/device_registry/remove_config_entry`. Both `device_id` and the
+    owning `config_entry_id` are required.
     """
     result = ha._ws_call(
-        "config_entries/remove_device",
+        "config/device_registry/remove_config_entry",
         device_id=device_id,
         config_entry_id=config_entry_id,
     )

@@ -2,29 +2,23 @@
 
 Themes live in `<config>/themes/<name>.yaml` and are loaded via the
 `frontend:` integration. Listing/active selection is done over WS/services.
-Creating/editing writes a YAML file and triggers `frontend.reload_themes`.
+Creating/editing goes through `tools.files` (SSH to the HA host — see that
+module for why: HA's config dir is not local to this machine) and triggers
+`frontend.reload_themes`.
 """
-import os
-from pathlib import Path
-
 import yaml
-from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 import ha_client as ha
-
-load_dotenv()
+from tools.files import read_config_file, write_config_file, delete_config_file, list_config_files
 
 mcp = FastMCP("themes")
 
-_CONFIG_PATH = Path(os.getenv("HA_CONFIG_PATH", "/config"))
-_THEMES_DIR = _CONFIG_PATH / "themes"
 
-
-def _theme_path(name: str) -> Path:
+def _theme_path(name: str) -> str:
     if "/" in name or "\\" in name or name.startswith(".") or not name.strip():
         raise ValueError(f"Invalid theme name: {name!r}")
-    return (_THEMES_DIR / f"{name}.yaml").resolve()
+    return f"themes/{name}.yaml"
 
 
 @mcp.tool()
@@ -77,15 +71,20 @@ def create_theme(
 
     Set `overwrite=True` to replace an existing theme. By default reload_themes is called.
     """
-    path = _theme_path(name)
-    if path.exists() and not overwrite:
-        return {"success": False, "error": f"Theme {name!r} already exists. Pass overwrite=True to replace."}
+    rel_path = _theme_path(name)
+    if not overwrite:
+        try:
+            read_config_file(rel_path)
+            return {"success": False, "error": f"Theme {name!r} already exists. Pass overwrite=True to replace."}
+        except FileNotFoundError:
+            pass
 
-    _THEMES_DIR.mkdir(parents=True, exist_ok=True)
     document = {name: variables}
-    path.write_text(yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    write_result = write_config_file(rel_path, yaml.safe_dump(document, sort_keys=False, allow_unicode=True))
+    if not write_result.get("success"):
+        return {"success": False, "error": write_result.get("error")}
 
-    result = {"success": True, "path": str(path)}
+    result = {"success": True, "path": write_result["path"]}
     if reload:
         ha.call_service("frontend", "reload_themes")
         result["reloaded"] = True
@@ -99,21 +98,25 @@ def update_theme(name: str, variables: dict, merge: bool = True, reload: bool = 
     `merge=True` (default) merges new variables into existing ones; `merge=False`
     replaces the whole variable set. Calls reload_themes unless reload=False.
     """
-    path = _theme_path(name)
-    if not path.exists():
-        return {"success": False, "error": f"Theme {name!r} not found at {path}"}
+    rel_path = _theme_path(name)
+    try:
+        existing_content = read_config_file(rel_path)
+    except FileNotFoundError:
+        return {"success": False, "error": f"Theme {name!r} not found at {rel_path}"}
 
     if merge:
-        existing = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        existing = yaml.safe_load(existing_content) or {}
         current_vars = existing.get(name, {}) or {}
         current_vars.update(variables)
         document = {name: current_vars}
     else:
         document = {name: variables}
 
-    path.write_text(yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    write_result = write_config_file(rel_path, yaml.safe_dump(document, sort_keys=False, allow_unicode=True))
+    if not write_result.get("success"):
+        return {"success": False, "error": write_result.get("error")}
 
-    result = {"success": True, "path": str(path), "merged": merge}
+    result = {"success": True, "path": write_result["path"], "merged": merge}
     if reload:
         ha.call_service("frontend", "reload_themes")
         result["reloaded"] = True
@@ -123,11 +126,13 @@ def update_theme(name: str, variables: dict, merge: bool = True, reload: bool = 
 @mcp.tool()
 def delete_theme(name: str, reload: bool = True) -> dict:
     """Delete a theme file from `themes/<name>.yaml`."""
-    path = _theme_path(name)
-    if not path.exists():
-        return {"success": False, "error": f"Theme {name!r} not found at {path}"}
-    path.unlink()
-    result = {"success": True, "deleted": str(path)}
+    rel_path = _theme_path(name)
+    try:
+        delete_result = delete_config_file(rel_path)
+    except FileNotFoundError:
+        return {"success": False, "error": f"Theme {name!r} not found at {rel_path}"}
+
+    result = {"success": True, "deleted": delete_result["deleted"]}
     if reload:
         ha.call_service("frontend", "reload_themes")
         result["reloaded"] = True
@@ -137,10 +142,4 @@ def delete_theme(name: str, reload: bool = True) -> dict:
 @mcp.tool()
 def list_theme_files() -> list[str]:
     """List YAML files under `themes/`. Useful when a theme exists on disk but isn't loaded yet."""
-    if not _THEMES_DIR.exists():
-        return []
-    return [
-        str(p.relative_to(_CONFIG_PATH))
-        for p in _THEMES_DIR.rglob("*")
-        if p.is_file() and p.suffix in {".yaml", ".yml"}
-    ]
+    return list_config_files("themes")
