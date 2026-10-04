@@ -92,6 +92,20 @@ Open <http://localhost:7123> to get your API key and MCP client configs.
 2. **Create Token** → name it `nexus`
 3. Paste as `HA_TOKEN` in `.env`
 
+### Supervisor add-on options
+
+`supervisor_get_addon` replaces secret-looking option values with `**REDACTED**`.
+Its `redacted_fields` list gives each affected option's path and the reason
+(password field in the add-on schema, secret-looking name, or URL containing
+credentials). To change other options, pass the full options object to
+`supervisor_set_addon_options`; unchanged `**REDACTED**` values are restored from
+the stored settings before the update. A list containing placeholders must keep
+its original length and order.
+
+This is a best-effort filter: a secret under an unknown name, with no password
+schema and no recognizable credential URL, may still appear in the response.
+Inspect add-on settings before sharing them outside your trusted environment.
+
 ---
 
 ## Connecting MCP Clients
