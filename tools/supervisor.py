@@ -9,6 +9,7 @@ before — only the transport changed).
 """
 import json as json_mod
 import os
+import re
 import shlex
 import subprocess
 
@@ -19,6 +20,93 @@ mcp = FastMCP("supervisor")
 _SSH_HOST = os.getenv("HA_SSH_HOST", "ha-green")
 _SSH_TIMEOUT = 30
 _STATUS_MARKER = "___HTTP_STATUS___"
+_REDACTED = "**REDACTED**"
+_SECRET_TOKENS = {"password", "passwd", "pass", "pwd", "secret", "token", "credential", "private"}
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_CREDENTIALS_IN_URL = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/@]+:[^\s/@]+@")
+
+
+def _secret_key(key: str) -> bool:
+    normalized = _NON_ALNUM.sub("_", _CAMEL_BOUNDARY.sub("_", key).lower()).strip("_")
+    for part in normalized.split("_"):
+        singular = part.rstrip("s") or part
+        if part in _SECRET_TOKENS or singular in _SECRET_TOKENS:
+            return True
+        if part in {"key", "keys", "apikey", "apikeys", "accesskey", "accesskeys"}:
+            return True
+    return False
+
+
+def _schema_nodes(schema: object) -> dict[str, dict]:
+    if not isinstance(schema, list):
+        return {}
+    return {node["name"]: node for node in schema
+            if isinstance(node, dict) and isinstance(node.get("name"), str)}
+
+
+def _redact_options(value: object, schema: dict[str, dict], path: str = "",
+                    key: str | None = None, node: dict | None = None) -> tuple[object, list[dict]]:
+    """Return a redacted copy and paths; never mutate Supervisor's response."""
+    if isinstance(value, dict):
+        result, fields = {}, []
+        for child_key, child in value.items():
+            child_node = schema.get(child_key, {})
+            child_schema = _schema_nodes(child_node.get("schema")) if child_node.get("type") == "schema" else {}
+            child_path = f"{path}.{child_key}" if path else str(child_key)
+            result[child_key], found = _redact_options(child, child_schema, child_path, child_key, child_node)
+            fields.extend(found)
+        return result, fields
+    if isinstance(value, list):
+        result, fields = [], []
+        for index, child in enumerate(value):
+            new_child, found = _redact_options(child, schema, f"{path}[{index}]", key, node)
+            result.append(new_child)
+            fields.extend(found)
+        return result, fields
+    reason = None
+    if (node or {}).get("format") == "password":
+        reason = "schema_password"
+    elif key is not None and _secret_key(key):
+        reason = "key_name_heuristic"
+    elif isinstance(value, str) and _CREDENTIALS_IN_URL.search(value):
+        reason = "credentials_in_url"
+    if reason and value not in (None, ""):
+        return _REDACTED, [{"path": path, "reason": reason}]
+    return value, []
+
+
+def _contains_marker(value: object) -> bool:
+    if value == _REDACTED:
+        return True
+    if isinstance(value, dict):
+        return any(_contains_marker(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_marker(item) for item in value)
+    return False
+
+
+class RedactionMergeError(ValueError):
+    pass
+
+
+def _restore_markers(new: object, old: object, path: str = "") -> object:
+    """Restore unchanged secrets from stored options, rejecting ambiguous lists."""
+    if new == _REDACTED:
+        if old is None:
+            raise RedactionMergeError(f"No stored value for {path or '<root>'}")
+        return old
+    if isinstance(new, dict):
+        old_dict = old if isinstance(old, dict) else {}
+        return {key: _restore_markers(value, old_dict.get(key), f"{path}.{key}" if path else key)
+                for key, value in new.items()}
+    if isinstance(new, list):
+        old_list = old if isinstance(old, list) else []
+        if _contains_marker(new) and len(new) != len(old_list):
+            raise RedactionMergeError(f"List length changed for {path or '<root>'}; re-read options")
+        return [_restore_markers(value, old_list[index] if index < len(old_list) else None,
+                                 f"{path}[{index}]") for index, value in enumerate(new)]
+    return new
 
 
 def _ssh_run(remote_cmd: str, input_data: str | None = None) -> subprocess.CompletedProcess:
@@ -116,8 +204,15 @@ def list_addons() -> dict:
 
 @mcp.tool()
 def get_addon(slug: str) -> dict:
-    """Get full info for a specific add-on by slug."""
-    return _supervisor_request("GET", f"/addons/{slug}/info")
+    """Get add-on info with secret-looking options replaced by placeholders."""
+    response = _supervisor_request("GET", f"/addons/{slug}/info")
+    if not isinstance(response, dict) or "error" in response:
+        return response
+    data = response.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("options"), dict):
+        return response
+    options, fields = _redact_options(data["options"], _schema_nodes(data.get("schema")))
+    return {**response, "data": {**data, "options": options}, "redacted_fields": fields}
 
 
 @mcp.tool()
@@ -175,8 +270,25 @@ def get_addon_logs(slug: str, lines: int = 100) -> dict:
 
 @mcp.tool()
 def set_addon_options(slug: str, options: dict) -> dict:
-    """Set configuration options for an add-on (sent as {"options": options})."""
-    return _supervisor_request("POST", f"/addons/{slug}/options", json={"options": options})
+    """Set options, restoring unchanged values represented by redaction markers."""
+    restored = _contains_marker(options)
+    if restored:
+        current = _supervisor_request("GET", f"/addons/{slug}/info")
+        if not isinstance(current, dict) or "error" in current:
+            return current
+        data = current.get("data")
+        stored = data.get("options") if isinstance(data, dict) else None
+        if not isinstance(stored, dict):
+            return {"error": "stored_options_unavailable"}
+        try:
+            options = _restore_markers(options, stored)
+        except RedactionMergeError as exc:
+            return {"error": "redaction_marker_unresolvable", "message": str(exc)}
+    result = _supervisor_request("POST", f"/addons/{slug}/options", json={"options": options})
+    if isinstance(result, dict) and "error" in result:
+        # Supervisor errors can echo submitted values, including new secrets.
+        return {"error": "options_update_failed", "message": "Supervisor rejected the options update"}
+    return result
 
 
 @mcp.tool()
